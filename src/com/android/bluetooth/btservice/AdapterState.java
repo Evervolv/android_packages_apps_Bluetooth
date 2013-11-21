@@ -163,7 +163,12 @@ final class AdapterState extends StateMachine {
                case USER_TURN_OFF:
                    //TODO: Handle case of service started and stopped without enable
                    break;
-
+               case ENABLED_READY:
+                   if (DBG) Log.d(TAG,"CURRENT_STATE=OFF, MESSAGE = ENABLED_READY");
+                   mAdapterProperties.onBluetoothReady();
+                   transitionTo(mOnState);
+                   notifyAdapterStateChange(BluetoothAdapter.STATE_ON);
+                   break;
                default:
                    return false;
             }
@@ -213,7 +218,6 @@ final class AdapterState extends StateMachine {
                         notifyAdapterStateChange(BluetoothAdapter.STATE_BLE_ON);
                    }
                    break;
-
                default:
                    return false;
             }
