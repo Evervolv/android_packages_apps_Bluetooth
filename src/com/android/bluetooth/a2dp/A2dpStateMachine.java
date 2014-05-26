@@ -34,14 +34,17 @@ import android.bluetooth.BluetoothDevice;
 import android.bluetooth.BluetoothProfile;
 import android.bluetooth.BluetoothUuid;
 import android.bluetooth.IBluetooth;
+import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.media.AudioManager;
+import android.media.AudioManager.OnAudioFocusChangeListener;
 import android.os.Handler;
 import android.os.Message;
 import android.os.ParcelUuid;
 import android.os.PowerManager;
 import android.os.PowerManager.WakeLock;
 import android.content.Intent;
+import android.content.IntentFilter;
 import android.os.Message;
 import android.os.RemoteException;
 import android.os.ServiceManager;
@@ -49,6 +52,7 @@ import android.os.ParcelUuid;
 import android.util.Log;
 import com.android.bluetooth.Utils;
 import com.android.bluetooth.btservice.AdapterService;
+import com.android.bluetooth.btservice.AbstractionLayer;
 import com.android.bluetooth.btservice.ProfileService;
 import com.android.internal.util.IState;
 import com.android.internal.util.State;
@@ -65,6 +69,9 @@ final class A2dpStateMachine extends StateMachine {
     private static final int STACK_EVENT = 101;
     private static final int CONNECT_TIMEOUT = 201;
 
+    private static final int IS_INVALID_DEVICE = 0;
+    private static final int IS_VALID_DEVICE = 1;
+
     private Disconnected mDisconnected;
     private Pending mPending;
     private Connected mConnected;
@@ -77,6 +84,10 @@ final class A2dpStateMachine extends StateMachine {
     private final WakeLock mWakeLock;
 
     private static final int MSG_CONNECTION_STATE_CHANGED = 0;
+
+    private static final int AUDIO_FOCUS_LOSS = 0;
+    private static final int AUDIO_FOCUS_GAIN = 1;
+    private static final int AUDIO_FOCUS_LOSS_TRANSIENT = 2;
 
     private static final ParcelUuid[] A2DP_UUIDS = {
         BluetoothUuid.AudioSink
@@ -136,6 +147,12 @@ final class A2dpStateMachine extends StateMachine {
         mWakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "BluetoothA2dpService");
 
         mIntentBroadcastHandler = new IntentBroadcastHandler();
+        IntentFilter filter = new IntentFilter("com.android.music.musicservicecommand");
+        try {
+            context.registerReceiver(mA2dpReceiver, filter);
+        } catch (Exception e) {
+            loge("Unable to register A2dp receiver: " + e);
+        }
 
         mAudioManager = (AudioManager) context.getSystemService(Context.AUDIO_SERVICE);
 
@@ -149,6 +166,17 @@ final class A2dpStateMachine extends StateMachine {
     }
 
     public void doQuit() {
+        try {
+            mContext.unregisterReceiver(mA2dpReceiver);
+        } catch (Exception e) {
+            log("Unable to unregister A2dp receiver" + e);
+        }
+        if ((mTargetDevice != null) &&
+            (getConnectionState(mTargetDevice) == BluetoothProfile.STATE_CONNECTING)) {
+            log("doQuit()- Move A2DP State to DISCONNECTED");
+            broadcastConnectionState(mTargetDevice, BluetoothProfile.STATE_DISCONNECTED,
+                                     BluetoothProfile.STATE_CONNECTING);
+        }
         quitNow();
     }
 
@@ -196,6 +224,7 @@ final class A2dpStateMachine extends StateMachine {
                     break;
                 case STACK_EVENT:
                     StackEvent event = (StackEvent) message.obj;
+                    log("Stack Event: " + event.type);
                     switch (event.type) {
                         case EVENT_TYPE_CONNECTION_STATE_CHANGED:
                             processConnectionEvent(event.valueInt, event.device);
@@ -266,7 +295,7 @@ final class A2dpStateMachine extends StateMachine {
                 }
                 break;
             case CONNECTION_STATE_DISCONNECTING:
-                logw("Ignore HF DISCONNECTING event, device: " + device);
+                logw("Ignore A2dp DISCONNECTING event, device: " + device);
                 break;
             default:
                 loge("Incorrect state: " + state);
@@ -310,6 +339,7 @@ final class A2dpStateMachine extends StateMachine {
                     break;
                 case STACK_EVENT:
                     StackEvent event = (StackEvent) message.obj;
+                    log("Stack Event: " + event.type);
                     switch (event.type) {
                         case EVENT_TYPE_CONNECTION_STATE_CHANGED:
                             removeMessages(CONNECT_TIMEOUT);
@@ -358,6 +388,14 @@ final class A2dpStateMachine extends StateMachine {
                         // outgoing connection failed
                         broadcastConnectionState(mTargetDevice, BluetoothProfile.STATE_DISCONNECTED,
                                                  BluetoothProfile.STATE_CONNECTING);
+                        // check if there is some incoming connection request
+                        if (mIncomingDevice != null) {
+                            logi("disconnect for outgoing in pending state");
+                            synchronized (A2dpStateMachine.this) {
+                                mTargetDevice = null;
+                            }
+                            break;
+                        }
                         synchronized (A2dpStateMachine.this) {
                             mTargetDevice = null;
                             transitionTo(mDisconnected);
@@ -398,10 +436,18 @@ final class A2dpStateMachine extends StateMachine {
                 } else if (mIncomingDevice != null && mIncomingDevice.equals(device)) {
                     broadcastConnectionState(mIncomingDevice, BluetoothProfile.STATE_CONNECTED,
                                              BluetoothProfile.STATE_CONNECTING);
-                    synchronized (A2dpStateMachine.this) {
-                        mCurrentDevice = mIncomingDevice;
-                        mIncomingDevice = null;
-                        transitionTo(mConnected);
+                    // check for a2dp connection allowed for this device in race condition
+                    if (okToConnect(mIncomingDevice)) {
+                        logi("Ready to connect incoming Connection from pending state");
+                        synchronized (A2dpStateMachine.this) {
+                            mCurrentDevice = mIncomingDevice;
+                            mIncomingDevice = null;
+                            transitionTo(mConnected);
+                        }
+                    } else {
+                        // A2dp connection unchecked for this device
+                        loge("Incoming A2DP rejected from pending state");
+                        disconnectA2dpNative(getByteAddress(device));
                     }
                 } else {
                     loge("Unknown device Connected: " + device);
@@ -431,7 +477,10 @@ final class A2dpStateMachine extends StateMachine {
                 } else {
                     // We get an incoming connecting request while Pending
                     // TODO(BT) is stack handing this case? let's ignore it for now
-                    log("Incoming connection while pending, ignore");
+                    log("Incoming connection while pending, accept it");
+                    broadcastConnectionState(device, BluetoothProfile.STATE_CONNECTING,
+                                             BluetoothProfile.STATE_DISCONNECTED);
+                    mIncomingDevice = device;
                 }
                 break;
             case CONNECTION_STATE_DISCONNECTING:
@@ -488,6 +537,9 @@ final class A2dpStateMachine extends StateMachine {
                         broadcastConnectionState(device, BluetoothProfile.STATE_DISCONNECTED,
                                        BluetoothProfile.STATE_CONNECTING);
                         break;
+                    } else {
+                        broadcastConnectionState(mCurrentDevice, BluetoothProfile.STATE_DISCONNECTING,
+                                       BluetoothProfile.STATE_CONNECTED);
                     }
 
                     synchronized (A2dpStateMachine.this) {
@@ -506,20 +558,29 @@ final class A2dpStateMachine extends StateMachine {
                                    BluetoothProfile.STATE_CONNECTED);
                     if (!disconnectA2dpNative(getByteAddress(device))) {
                         broadcastConnectionState(device, BluetoothProfile.STATE_CONNECTED,
-                                       BluetoothProfile.STATE_DISCONNECTED);
+                                       BluetoothProfile.STATE_DISCONNECTING);
                         break;
+                    }
+                    if (mPlayingA2dpDevice != null) {
+                        broadcastAudioState(mPlayingA2dpDevice, BluetoothA2dp.STATE_NOT_PLAYING,
+                                            BluetoothA2dp.STATE_PLAYING);
+                        mPlayingA2dpDevice = null;
                     }
                     transitionTo(mPending);
                 }
                     break;
                 case STACK_EVENT:
                     StackEvent event = (StackEvent) message.obj;
+                    log("Stack Event: " + event.type);
                     switch (event.type) {
                         case EVENT_TYPE_CONNECTION_STATE_CHANGED:
                             processConnectionEvent(event.valueInt, event.device);
                             break;
                         case EVENT_TYPE_AUDIO_STATE_CHANGED:
                             processAudioStateEvent(event.valueInt, event.device);
+                            break;
+                        case EVENT_TYPE_REQUEST_AUDIO_FOCUS:
+                            processAudioFocusRequestEvent(event.valueInt, event.device);
                             break;
                         default:
                             loge("Unexpected stack event: " + event.type);
@@ -543,21 +604,55 @@ final class A2dpStateMachine extends StateMachine {
                             mCurrentDevice = null;
                             transitionTo(mDisconnected);
                         }
+                    } else if (mTargetDevice != null && mTargetDevice.equals(device)) {
+                        broadcastConnectionState(device, BluetoothProfile.STATE_DISCONNECTED,
+                                                 BluetoothProfile.STATE_CONNECTING);
+                        synchronized (A2dpStateMachine.this) {
+                            mTargetDevice = null;
+                        }
+                        logi("Disconnected from mTargetDevice in connected state device: " + device);
                     } else {
                         loge("Disconnected from unknown device: " + device);
                     }
+
+                    if (mService.getLastConnectedA2dpSepType(device)
+                                == BluetoothProfile.PROFILE_A2DP_SRC) {
+                        // in case PEER DEVICE is A2DP SRC we need to manager audio focus
+                        int status = mAudioManager.abandonAudioFocus(mAudioFocusListener);
+                        log("Status loss returned " + status);
+                        informAudioFocusStateNative(AUDIO_FOCUS_LOSS);
+                    }
+
                     break;
               default:
                   loge("Connection State Device: " + device + " bad state: " + state);
                   break;
             }
         }
+
+        private void processAudioFocusRequestEvent(int enable, BluetoothDevice device) {
+            if (mPlayingA2dpDevice != null) {
+                if ((mService.getLastConnectedA2dpSepType(device)
+                        == BluetoothProfile.PROFILE_A2DP_SRC) && (enable == 1)){
+                    // in case PEER DEVICE is A2DP SRC we need to manager audio focus
+                    int status =  mAudioManager.requestAudioFocus(mAudioFocusListener,
+                               AudioManager.STREAM_MUSIC,AudioManager.AUDIOFOCUS_GAIN);
+                    loge("Status gain returned " + status);
+                    if (status == AudioManager.AUDIOFOCUS_REQUEST_GRANTED)
+                        informAudioFocusStateNative(AUDIO_FOCUS_GAIN);
+                    else
+                        informAudioFocusStateNative(AUDIO_FOCUS_LOSS);
+               }
+            }
+        }
+
         private void processAudioStateEvent(int state, BluetoothDevice device) {
             if (!mCurrentDevice.equals(device)) {
                 loge("Audio State Device:" + device + "is different from ConnectedDevice:" +
                                                            mCurrentDevice);
                 return;
             }
+            log("processAudioStateEvent  " + state);
             switch (state) {
                 case AUDIO_STATE_STARTED:
                     if (mPlayingA2dpDevice == null) {
@@ -567,7 +662,7 @@ final class A2dpStateMachine extends StateMachine {
                     }
                     break;
                 case AUDIO_STATE_STOPPED:
-                    if(mPlayingA2dpDevice != null) {
+                    if (mPlayingA2dpDevice != null) {
                         mPlayingA2dpDevice = null;
                         broadcastAudioState(device, BluetoothA2dp.STATE_NOT_PLAYING,
                                             BluetoothA2dp.STATE_PLAYING);
@@ -578,6 +673,16 @@ final class A2dpStateMachine extends StateMachine {
                   break;
             }
         }
+    }
+
+    // true if peer device is source
+    boolean isConnectedSrc(BluetoothDevice device)
+    {
+        if (mService.getLastConnectedA2dpSepType(device)
+                == BluetoothProfile.PROFILE_A2DP_SRC)
+            return true;
+        else
+            return false;
     }
 
     int getConnectionState(BluetoothDevice device) {
@@ -676,9 +781,49 @@ final class A2dpStateMachine extends StateMachine {
     // This method does not check for error conditon (newState == prevState)
     private void broadcastConnectionState(BluetoothDevice device, int newState, int prevState) {
 
-        int delay = mAudioManager.setBluetoothA2dpDeviceConnectionState(device, newState);
+        int delay = 0;
+        int remoteSepConnected;
+        // only in case of Connected State we make native call
+        // and update Profile information.
+        if (newState == BluetoothProfile.STATE_CONNECTED) {
+            // peer device is SNK
+            if (isSrcNative(getByteAddress(device))
+                    == AbstractionLayer.BT_STATUS_FAIL) {
+                log("Peer Device is SNK");
+                mService.setLastConnectedA2dpSepType (device,
+                        BluetoothProfile.PROFILE_A2DP_SNK);
+            }
+            else if (isSrcNative(getByteAddress(device))
+                    == AbstractionLayer.BT_STATUS_SUCCESS) {
+                log("Peer Device is SRC");
+                mService.setLastConnectedA2dpSepType (device,
+                        BluetoothProfile.PROFILE_A2DP_SRC);
+            }
+        }
+
+        // now get profile value of this device.
+        remoteSepConnected = mService.getLastConnectedA2dpSepType(device);
+
+        if (remoteSepConnected == BluetoothProfile.PROFILE_A2DP_SNK)
+            log(" Remote Sep Connected " + "SINK" + "device: " + device);
+        if (remoteSepConnected == BluetoothProfile.PROFILE_A2DP_SRC)
+            log(" Remote Sep Connected " + "SRC" + "device: " + device);
+        if (remoteSepConnected == BluetoothProfile.PROFILE_A2DP_UNDEFINED)
+            log(" Remote Sep Connected " + "NO Records" + "device: " + device);
+
+        if ((remoteSepConnected == BluetoothProfile.PROFILE_A2DP_SNK) &&
+                        (newState != BluetoothProfile.STATE_CONNECTING)) {
+            // inform Audio Manager now
+            log(" updating audioManager state: " + newState);
+            delay = mAudioManager.setBluetoothA2dpDeviceConnectionState(device, newState);
+        }
+
+        // in disconnecting case, we do not want a delay
+        if (newState == BluetoothProfile.STATE_DISCONNECTING)
+            delay = 0;
 
         mWakeLock.acquire();
+        log("delay is " + delay + "for device " + device);
         mIntentBroadcastHandler.sendMessageDelayed(mIntentBroadcastHandler.obtainMessage(
                                                         MSG_CONNECTION_STATE_CHANGED,
                                                         prevState,
@@ -715,6 +860,31 @@ final class A2dpStateMachine extends StateMachine {
         event.device = getDevice(address);
         sendMessage(STACK_EVENT, event);
     }
+
+    private void onCheckConnectionPriority(byte[] address) {
+        BluetoothDevice device = getDevice(address);
+        logw(" device " + device + " okToConnect " + okToConnect(device));
+        if (okToConnect(device)) {
+            // if connection is allowed then go ahead and connect
+            allowConnectionNative(IS_VALID_DEVICE);
+        } else {
+            // if connection is not allowed DO NOT CONNECT
+            allowConnectionNative(IS_INVALID_DEVICE);
+        }
+    }
+
+    private void onAudioFocusRequest(int enable, byte[] address) {
+        BluetoothDevice device = getDevice(address);
+        logw(" checkaudiofocus for  " + device + "enable" + enable);
+        if (1 == enable) {
+            // send a request for audio_focus
+            StackEvent event = new StackEvent(EVENT_TYPE_REQUEST_AUDIO_FOCUS);
+            event.valueInt = enable;
+            event.device = getDevice(address);
+            sendMessage(STACK_EVENT, event);
+        }
+    }
+
     private BluetoothDevice getDevice(byte[] address) {
         return mAdapter.getRemoteDevice(Utils.getAddressStringFromByte(address));
     }
@@ -753,11 +923,83 @@ final class A2dpStateMachine extends StateMachine {
         }
     }
 
+    private final BroadcastReceiver mA2dpReceiver = new BroadcastReceiver() {
+    @Override
+        public void onReceive(Context context, Intent intent) {
+            String action = intent.getAction();
+            log("onReceive  " + action);
+            if (action.equals("com.android.music.musicservicecommand")) {
+                String cmd = intent.getStringExtra("command");
+                log("Command Received  " + cmd);
+                if (cmd.equals("pause")) {
+                    if (mCurrentDevice != null) {
+                        if (mService.getLastConnectedA2dpSepType(mCurrentDevice)
+                                == BluetoothProfile.PROFILE_A2DP_SRC) {
+                            //Camera Pauses the Playback before starting the Video recording
+                            //But it doesn't start the playback once recording is completed.
+                            //Disconnecting the A2dp to move the A2dpSink to proper state.
+                            disconnectA2dpNative(getByteAddress(mCurrentDevice));
+                            // in case PEER DEVICE is A2DP SRC we need to manage audio focus
+                            int status = mAudioManager.abandonAudioFocus(mAudioFocusListener);
+                            log("abandonAudioFocus returned" + status);
+                        }
+                    } else {
+                        int status = mAudioManager.abandonAudioFocus(mAudioFocusListener);
+                        log("abandonAudioFocus returned" + status);
+                    }
+                }
+            }
+        }
+    };
+
+    private OnAudioFocusChangeListener mAudioFocusListener = new OnAudioFocusChangeListener(){
+        public void onAudioFocusChange(int focusChange){
+            log("onAudioFocusChangeListener  focuschange" + focusChange);
+            switch(focusChange){
+                case AudioManager.AUDIOFOCUS_LOSS:
+                    if (mCurrentDevice != null) {
+                        if (mService.getLastConnectedA2dpSepType(mCurrentDevice)
+                                   == BluetoothProfile.PROFILE_A2DP_SRC) {
+                            // in case of perm loss, disconnect the link
+                            disconnectA2dpNative(getByteAddress(mCurrentDevice));
+                            // in case PEER DEVICE is A2DP SRC we need to manage audio focus
+                            int status = mAudioManager.abandonAudioFocus(mAudioFocusListener);
+                            log("abandonAudioFocus returned" + status);
+                        }
+                    } else {
+                        int status = mAudioManager.abandonAudioFocus(mAudioFocusListener);
+                        log("abandonAudioFocus returned" + status);
+                    }
+                    break;
+                case AudioManager.AUDIOFOCUS_LOSS_TRANSIENT:
+                    if ((mCurrentDevice != null) && (getCurrentState() == mConnected) &&
+                        (isPlaying(mCurrentDevice))) {
+                        informAudioFocusStateNative(AUDIO_FOCUS_LOSS_TRANSIENT);
+                        // we need to send AVDT_SUSPEND from here
+                        suspendA2dpNative();
+                    }
+                    break;
+                case AudioManager.AUDIOFOCUS_GAIN:
+                    // we got focus gain
+                    log(" Received Focus Gain");
+                    informAudioFocusStateNative(AUDIO_FOCUS_GAIN);
+                    if ((mCurrentDevice != null) && (getCurrentState() == mConnected) &&
+                        (!isPlaying(mCurrentDevice))){
+                        resumeA2dpNative();
+                    }
+                    break;
+                default:
+                    break;
+            }
+        }
+    };
+
 
     // Event types for STACK_EVENT message
     final private static int EVENT_TYPE_NONE = 0;
     final private static int EVENT_TYPE_CONNECTION_STATE_CHANGED = 1;
     final private static int EVENT_TYPE_AUDIO_STATE_CHANGED = 2;
+    final private static int EVENT_TYPE_REQUEST_AUDIO_FOCUS = 3;
 
    // Do not modify without updating the HAL bt_av.h files.
 
@@ -777,4 +1019,9 @@ final class A2dpStateMachine extends StateMachine {
     private native void cleanupNative();
     private native boolean connectA2dpNative(byte[] address);
     private native boolean disconnectA2dpNative(byte[] address);
+    private native void allowConnectionNative(int isValid);
+    private native int isSrcNative(byte[] address);
+    private native void suspendA2dpNative();
+    private native void resumeA2dpNative();
+    private native void informAudioFocusStateNative(int state);
 }

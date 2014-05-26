@@ -28,6 +28,8 @@
 namespace android {
 static jmethodID method_onConnectionStateChanged;
 static jmethodID method_onAudioStateChanged;
+static jmethodID method_onCheckConnectionPriority;
+static jmethodID method_onAudioFocusRequest;
 
 static const btav_interface_t *sBluetoothA2dpInterface = NULL;
 static jobject mCallbacksObj = NULL;
@@ -93,10 +95,55 @@ static void bta2dp_audio_state_callback(btav_audio_state_t state, bt_bdaddr_t* b
     sCallbackEnv->DeleteLocalRef(addr);
 }
 
+static void bta2dp_connection_priority_callback(bt_bdaddr_t* bd_addr) {
+    jbyteArray addr;
+
+    ALOGI("%s", __FUNCTION__);
+
+    if (!checkCallbackThread()) {                                       \
+        ALOGE("Callback: '%s' is not called on the correct thread", __FUNCTION__); \
+        return;                                                         \
+    }
+    addr = sCallbackEnv->NewByteArray(sizeof(bt_bdaddr_t));
+    if (!addr) {
+        ALOGE("Fail to new jbyteArray bd addr for connection state");
+        checkAndClearExceptionFromCallback(sCallbackEnv, __FUNCTION__);
+        return;
+    }
+
+    sCallbackEnv->SetByteArrayRegion(addr, 0, sizeof(bt_bdaddr_t), (jbyte*) bd_addr);
+    sCallbackEnv->CallVoidMethod(mCallbacksObj, method_onCheckConnectionPriority, addr);
+    checkAndClearExceptionFromCallback(sCallbackEnv, __FUNCTION__);
+    sCallbackEnv->DeleteLocalRef(addr);
+}
+
+static void bta2dp_audio_focus_request_callback(int enable, bt_bdaddr_t* bd_addr) {
+    jbyteArray addr;
+
+    ALOGI("%s", __FUNCTION__);
+
+    if (!checkCallbackThread()) {                                       \
+        ALOGE("Callback: '%s' is not called on the correct thread", __FUNCTION__); \
+        return;                                                         \
+    }
+    addr = sCallbackEnv->NewByteArray(sizeof(bt_bdaddr_t));
+    if (!addr) {
+        ALOGE("Fail to new jbyteArray bd addr for connection state");
+        checkAndClearExceptionFromCallback(sCallbackEnv, __FUNCTION__);
+        return;
+    }
+
+    sCallbackEnv->SetByteArrayRegion(addr, 0, sizeof(bt_bdaddr_t), (jbyte*) bd_addr);
+    sCallbackEnv->CallVoidMethod(mCallbacksObj, method_onAudioFocusRequest, (jint) enable, addr);
+    checkAndClearExceptionFromCallback(sCallbackEnv, __FUNCTION__);
+    sCallbackEnv->DeleteLocalRef(addr);
+}
 static btav_callbacks_t sBluetoothA2dpCallbacks = {
     sizeof(sBluetoothA2dpCallbacks),
     bta2dp_connection_state_callback,
-    bta2dp_audio_state_callback
+    bta2dp_audio_state_callback,
+    bta2dp_connection_priority_callback,
+    bta2dp_audio_focus_request_callback
 };
 
 static void classInitNative(JNIEnv* env, jclass clazz) {
@@ -109,6 +156,12 @@ static void classInitNative(JNIEnv* env, jclass clazz) {
 
     method_onAudioStateChanged =
         env->GetMethodID(clazz, "onAudioStateChanged", "(I[B)V");
+
+    method_onCheckConnectionPriority =
+        env->GetMethodID(clazz, "onCheckConnectionPriority", "([B)V");
+
+    method_onAudioFocusRequest =
+        env->GetMethodID(clazz, "onAudioFocusRequest", "(I[B)V");
     /*
     if ( (btInf = getBluetoothInterface()) == NULL) {
         ALOGE("Bluetooth module is not loaded");
@@ -225,11 +278,73 @@ static jboolean disconnectA2dpNative(JNIEnv *env, jobject object, jbyteArray add
     }
 
     if ( (status = sBluetoothA2dpInterface->disconnect((bt_bdaddr_t *)addr)) != BT_STATUS_SUCCESS) {
-        ALOGE("Failed HF disconnection, status: %d", status);
+        ALOGE("Failed A2DP disconnection, status: %d", status);
     }
     env->ReleaseByteArrayElements(address, addr, 0);
     return (status == BT_STATUS_SUCCESS) ? JNI_TRUE : JNI_FALSE;
 }
+
+static void allowConnectionNative(JNIEnv *env, jobject object, int is_valid) {
+
+    if (!sBluetoothA2dpInterface) {
+        ALOGE("sBluetoothA2dpInterface is NULL ");
+        return;
+    }
+
+    sBluetoothA2dpInterface->allow_connection(is_valid);
+
+}
+
+static void informAudioFocusStateNative(JNIEnv *env, jobject object, int state) {
+
+    if (!sBluetoothA2dpInterface) {
+        ALOGE("sBluetoothA2dpInterface is NULL ");
+        return;
+    }
+    sBluetoothA2dpInterface->audio_focus_status(state);
+
+}
+
+static jint isSrcNative(JNIEnv *env, jobject object, jbyteArray address) {
+    jbyte *addr;
+    bt_status_t status;
+
+    if (!sBluetoothA2dpInterface) {
+        ALOGE("sBluetoothA2dpInterface is NULL ");
+        return JNI_FALSE;
+    }
+
+    addr = env->GetByteArrayElements(address, NULL);
+    if (!addr) {
+        jniThrowIOException(env, EINVAL);
+        return JNI_FALSE;
+    }
+
+    status = sBluetoothA2dpInterface->is_src((bt_bdaddr_t *)addr);
+    env->ReleaseByteArrayElements(address, addr, 0);
+    return status;
+}
+
+static void suspendA2dpNative(JNIEnv *env, jobject object) {
+
+    if (!sBluetoothA2dpInterface) {
+        ALOGE("sBluetoothA2dpInterface is NULL ");
+        return;
+    }
+
+    sBluetoothA2dpInterface->suspend_sink();
+}
+
+static void resumeA2dpNative(JNIEnv *env, jobject object) {
+
+    if (!sBluetoothA2dpInterface) {
+        ALOGE("sBluetoothA2dpInterface is NULL ");
+        return;
+    }
+
+    sBluetoothA2dpInterface->resume_sink();
+}
+
 
 static JNINativeMethod sMethods[] = {
     {"classInitNative", "()V", (void *) classInitNative},
@@ -237,11 +352,16 @@ static JNINativeMethod sMethods[] = {
     {"cleanupNative", "()V", (void *) cleanupNative},
     {"connectA2dpNative", "([B)Z", (void *) connectA2dpNative},
     {"disconnectA2dpNative", "([B)Z", (void *) disconnectA2dpNative},
+    {"allowConnectionNative", "(I)V", (void *) allowConnectionNative},
+    {"isSrcNative", "([B)I", (void *) isSrcNative},
+    {"suspendA2dpNative", "()V", (void *) suspendA2dpNative},
+    {"resumeA2dpNative", "()V", (void *) resumeA2dpNative},
+    {"informAudioFocusStateNative", "(I)V", (void *) informAudioFocusStateNative},
 };
 
 int register_com_android_bluetooth_a2dp(JNIEnv* env)
 {
-    return jniRegisterNativeMethods(env, "com/android/bluetooth/a2dp/A2dpStateMachine", 
+    return jniRegisterNativeMethods(env, "com/android/bluetooth/a2dp/A2dpStateMachine",
                                     sMethods, NELEM(sMethods));
 }
 

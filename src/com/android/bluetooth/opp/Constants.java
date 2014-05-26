@@ -213,14 +213,19 @@ public class Constants {
         "text/x-vcard",
         "text/plain",
         "text/html",
+        "text/comma-separated-values",
+        "text/calendar",
         "application/zip",
         "application/vnd.ms-excel",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         "application/msword",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         "application/vnd.ms-powerpoint",
         "application/pdf",
         "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        "application/vnd.android.package-archive",
     };
 
     /**
@@ -271,6 +276,8 @@ public class Constants {
     public static final String BLUETOOTHOPP_CHANNEL_PREFERENCE = "btopp_channels";
 
     public static String filename_SEQUENCE_SEPARATOR = "-";
+
+    public static boolean ZERO_LENGTH_FILE = false;
 
     public static void updateShareStatus(Context context, int id, int status) {
         Uri contentUri = Uri.parse(BluetoothShare.CONTENT_URI + "/" + id);

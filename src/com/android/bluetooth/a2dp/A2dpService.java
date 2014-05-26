@@ -18,9 +18,11 @@ package com.android.bluetooth.a2dp;
 
 import android.bluetooth.BluetoothDevice;
 import android.bluetooth.BluetoothProfile;
+import android.bluetooth.BluetoothUuid;
 import android.bluetooth.IBluetoothA2dp;
 import android.content.Context;
 import android.content.Intent;
+import android.os.ParcelUuid;
 import android.provider.Settings;
 import android.util.Log;
 import com.android.bluetooth.btservice.ProfileService;
@@ -41,6 +43,13 @@ public class A2dpService extends ProfileService {
     private A2dpStateMachine mStateMachine;
     private Avrcp mAvrcp;
     private static A2dpService sAd2dpService;
+    static final ParcelUuid[] A2DP_SOURCE_UUID = {
+        BluetoothUuid.AudioSource
+    };
+    static final ParcelUuid[] A2DP_SOURCE_SINK_UUIDS = {
+        BluetoothUuid.AudioSource,
+        BluetoothUuid.AudioSink
+    };
 
     protected String getName() {
         return TAG;
@@ -58,8 +67,12 @@ public class A2dpService extends ProfileService {
     }
 
     protected boolean stop() {
-        mStateMachine.doQuit();
-        mAvrcp.doQuit();
+        if (mStateMachine != null) {
+            mStateMachine.doQuit();
+        }
+        if (mAvrcp != null) {
+            mAvrcp.doQuit();
+        }
         return true;
     }
 
@@ -118,6 +131,12 @@ public class A2dpService extends ProfileService {
         if (getPriority(device) == BluetoothProfile.PRIORITY_OFF) {
             return false;
         }
+        ParcelUuid[] featureUuids = device.getUuids();
+        if ((BluetoothUuid.containsAnyUuid(featureUuids, A2DP_SOURCE_UUID)) &&
+            !(BluetoothUuid.containsAllUuids(featureUuids ,A2DP_SOURCE_SINK_UUIDS))) {
+            Log.e(TAG,"Remote does not have A2dp Sink UUID");
+            return false;
+        }
 
         int connectionState = mStateMachine.getConnectionState(device);
         if (connectionState == BluetoothProfile.STATE_CONNECTED ||
@@ -160,6 +179,12 @@ public class A2dpService extends ProfileService {
     public boolean setPriority(BluetoothDevice device, int priority) {
         enforceCallingOrSelfPermission(BLUETOOTH_ADMIN_PERM,
                                        "Need BLUETOOTH_ADMIN permission");
+
+        if ((mStateMachine.isConnectedSrc(device)) &&
+            (priority == BluetoothProfile.PRIORITY_AUTO_CONNECT)) {
+            if (DBG) Log.d(TAG,"Peer Device is SRC Ignore AutoConnect");
+            return false;
+        }
         Settings.Global.putInt(getContentResolver(),
             Settings.Global.getBluetoothA2dpSinkPriorityKey(device.getAddress()),
             priority);
@@ -175,6 +200,28 @@ public class A2dpService extends ProfileService {
             BluetoothProfile.PRIORITY_UNDEFINED);
         return priority;
     }
+
+    public boolean setLastConnectedA2dpSepType(BluetoothDevice device, int sepType) {
+        enforceCallingOrSelfPermission(BLUETOOTH_ADMIN_PERM,
+                                       "Need BLUETOOTH_ADMIN permission");
+
+        Log.d(TAG,"setLastConnectedA2dpSepType: " + sepType);
+
+        Settings.Global.putInt(getContentResolver(),
+            Settings.Global.getBluetoothLastConnectedA2dpSepTypeKey(device.getAddress()),
+            sepType);
+        return true;
+    }
+
+    public int getLastConnectedA2dpSepType(BluetoothDevice device) {
+        enforceCallingOrSelfPermission(BLUETOOTH_ADMIN_PERM,
+                                       "Need BLUETOOTH_ADMIN permission");
+        int sepType = Settings.Global.getInt(getContentResolver(),
+            Settings.Global.getBluetoothLastConnectedA2dpSepTypeKey(device.getAddress()),
+            BluetoothProfile.PROFILE_A2DP_UNDEFINED);
+        return sepType;
+    }
+
 
     /* Absolute volume implementation */
     public boolean isAvrcpAbsoluteVolumeSupported() {
