@@ -400,7 +400,7 @@ public class AdapterService extends Service {
         mAdapterProperties.init(mRemoteDevices);
 
         debugLog("processStart() - Make Bond State Machine");
-        mBondStateMachine = BondStateMachine.make(this, mAdapterProperties, mRemoteDevices);
+        mBondStateMachine = BondStateMachine.make(mPowerManager, this, mAdapterProperties, mRemoteDevices);
 
         mJniCallbacks.init(mBondStateMachine,mRemoteDevices);
 
@@ -1595,9 +1595,9 @@ public class AdapterService extends Service {
      void setProfileAutoConnectionPriority (BluetoothDevice device, int profileId){
          if (profileId == BluetoothProfile.HEADSET) {
              HeadsetService  hsService = HeadsetService.getHeadsetService();
-             List<BluetoothDevice> deviceList = hsService.getConnectedDevices();
              if ((hsService != null) &&
                 (BluetoothProfile.PRIORITY_AUTO_CONNECT != hsService.getPriority(device))){
+                 List<BluetoothDevice> deviceList = hsService.getConnectedDevices();
                  adjustOtherHeadsetPriorities(hsService, deviceList);
                  hsService.setPriority(device,BluetoothProfile.PRIORITY_AUTO_CONNECT);
              }
@@ -1768,8 +1768,21 @@ public class AdapterService extends Service {
         if (!pref.contains(device.getAddress())) {
             return BluetoothDevice.ACCESS_UNKNOWN;
         }
-        return pref.getBoolean(device.getAddress(), false)
-                ? BluetoothDevice.ACCESS_ALLOWED : BluetoothDevice.ACCESS_REJECTED;
+        try {
+            return pref.getInt(device.getAddress(), BluetoothDevice.ACCESS_UNKNOWN);
+        } catch (ClassCastException e) {
+            // Handle and change old boolean preferences to the int-based values
+            boolean currentPref = pref.getBoolean(device.getAddress(), false);
+            int newPref = currentPref ?
+                BluetoothDevice.ACCESS_ALLOWED : BluetoothDevice.ACCESS_REJECTED;
+
+            SharedPreferences.Editor editor = pref.edit();
+            editor.putInt(device.getAddress(), newPref);
+            if (editor.commit()) {
+                return newPref;
+            }
+            return BluetoothDevice.ACCESS_UNKNOWN;
+        }
     }
 
     boolean setPhonebookAccessPermission(BluetoothDevice device, int value) {
@@ -1781,7 +1794,7 @@ public class AdapterService extends Service {
         if (value == BluetoothDevice.ACCESS_UNKNOWN) {
             editor.remove(device.getAddress());
         } else {
-            editor.putBoolean(device.getAddress(), value == BluetoothDevice.ACCESS_ALLOWED);
+            editor.putInt(device.getAddress(), value);
         }
         return editor.commit();
     }

@@ -50,6 +50,7 @@ import android.os.Handler;
 import android.os.Message;
 import android.os.PowerManager;
 import android.os.PowerManager.WakeLock;
+import android.provider.Settings;
 import android.os.Process;
 import android.util.Log;
 import android.webkit.MimeTypeMap;
@@ -110,20 +111,22 @@ public class BluetoothOppObexServerSession extends ServerRequestHandler implemen
 
     private BluetoothOppReceiveFileInfo mFileInfo;
 
+    private PowerManager pm;
+
     private WakeLock mWakeLock;
 
     private WakeLock mPartialWakeLock;
+
+    private long position;
 
     boolean mTimeoutMsgSent = false;
 
     boolean mTransferInProgress = false;
 
-    private int position;
-
     public BluetoothOppObexServerSession(Context context, ObexTransport transport) {
         mContext = context;
         mTransport = transport;
-        PowerManager pm = (PowerManager)mContext.getSystemService(Context.POWER_SERVICE);
+        pm = (PowerManager)mContext.getSystemService(Context.POWER_SERVICE);
         mWakeLock = pm.newWakeLock(PowerManager.FULL_WAKE_LOCK | PowerManager.ACQUIRE_CAUSES_WAKEUP
                 | PowerManager.ON_AFTER_RELEASE, TAG);
         mPartialWakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, TAG);
@@ -194,7 +197,6 @@ public class BluetoothOppObexServerSession extends ServerRequestHandler implemen
 
     private class ContentResolverUpdateThread extends Thread {
 
-        private static final int sSleepTime = 1000;
         private Uri contentUri;
         private Context mContext1;
         private volatile boolean interrupted = false;
@@ -210,10 +212,12 @@ public class BluetoothOppObexServerSession extends ServerRequestHandler implemen
             Process.setThreadPriority(Process.THREAD_PRIORITY_BACKGROUND);
             ContentValues updateValues;
             while (true) {
-                updateValues = new ContentValues();
-                updateValues.put(BluetoothShare.CURRENT_BYTES, position);
-                mContext1.getContentResolver().update(contentUri, updateValues,
-                        null, null);
+                if (pm.isScreenOn()) {
+                    updateValues = new ContentValues();
+                    updateValues.put(BluetoothShare.CURRENT_BYTES, position);
+                    mContext1.getContentResolver().update(contentUri, updateValues,
+                            null, null);
+                }
 
                 /* Check if the Operation is interrupted before entering sleep */
                 if (interrupted == true) {
@@ -222,7 +226,7 @@ public class BluetoothOppObexServerSession extends ServerRequestHandler implemen
                 }
 
                 try {
-                    Thread.sleep(sSleepTime);
+                    Thread.sleep(BluetoothShare.UI_UPDATE_INTERVAL);
                 } catch (InterruptedException e1) {
                     if (V) Log.v(TAG, "Server ContentResolverUpdateThread was interrupted (1), exiting");
                     return;
@@ -286,6 +290,8 @@ public class BluetoothOppObexServerSession extends ServerRequestHandler implemen
         }
         boolean isWhitelisted = BluetoothOppManager.getInstance(mContext).
                 isWhitelisted(destination);
+        boolean isAcceptAllFilesEnabled = Settings.System.getInt(mContext.getContentResolver(),
+                Settings.System.BLUETOOTH_ACCEPT_ALL_FILES, 0) == 1;
 
         try {
             boolean pre_reject = false;
@@ -324,47 +330,65 @@ public class BluetoothOppObexServerSession extends ServerRequestHandler implemen
                 obexResponse = ResponseCodes.OBEX_HTTP_BAD_REQUEST;
             }
 
-            if (!pre_reject) {
-                /* first we look for Mimetype in Android map */
-                String extension, type;
-                int dotIndex = name.lastIndexOf(".");
-                if (dotIndex < 0 && mimeType == null) {
-                    if (D) Log.w(TAG, "There is no file extension or mime type," +
-                            "reject the transfer");
-                    pre_reject = true;
-                    obexResponse = ResponseCodes.OBEX_HTTP_BAD_REQUEST;
-                } else {
-                    extension = name.substring(dotIndex + 1).toLowerCase();
-                    MimeTypeMap map = MimeTypeMap.getSingleton();
-                    type = map.getMimeTypeFromExtension(extension);
-                    if (V) Log.v(TAG, "Mimetype guessed from extension " + extension + " is " + type);
-                    if (type != null) {
-                        mimeType = type;
-
+            if (!isAcceptAllFilesEnabled) {
+                if (!pre_reject) {
+                    /* first we look for Mimetype in Android map */
+                    String extension, type;
+                    int dotIndex = name.lastIndexOf(".");
+                    if (dotIndex < 0 && mimeType == null) {
+                        if (D)
+                            Log.w(TAG, "There is no file extension or mime type," +
+                                    "reject the transfer. File name:" + name);
+                        pre_reject = true;
+                        obexResponse = ResponseCodes.OBEX_HTTP_BAD_REQUEST;
                     } else {
-                        if (mimeType == null) {
-                            if (D) Log.w(TAG, "Can't get mimetype, reject the transfer");
-                            pre_reject = true;
-                            obexResponse = ResponseCodes.OBEX_HTTP_UNSUPPORTED_TYPE;
+                        extension = name.substring(dotIndex + 1).toLowerCase();
+                        MimeTypeMap map = MimeTypeMap.getSingleton();
+                        type = map.getMimeTypeFromExtension(extension);
+                        if (V)
+                            Log.v(TAG, "Mimetype guessed from extension " + extension + " is "
+                                    + type);
+                        if (type != null) {
+                            mimeType = type;
+
+                        } else {
+                            if (mimeType == null) {
+                                if (D)
+                                    Log.w(TAG, "Can't get mimetype, reject the transfer");
+                                pre_reject = true;
+                                obexResponse = ResponseCodes.OBEX_HTTP_UNSUPPORTED_TYPE;
+                            }
+                        }
+                        if (mimeType != null) {
+                            mimeType = mimeType.toLowerCase();
                         }
                     }
-                    if (mimeType != null) {
-                        mimeType = mimeType.toLowerCase();
-                    }
                 }
-            }
 
-            // Reject policy: anything outside the "white list" plus unspecified
-            // MIME Types. Also reject everything in the "black list".
-            if (!pre_reject
-                    && (mimeType == null
-                            || (!isWhitelisted && !Constants.mimeTypeMatches(mimeType,
-                                    Constants.ACCEPTABLE_SHARE_INBOUND_TYPES))
-                            || Constants.mimeTypeMatches(mimeType,
-                                    Constants.UNACCEPTABLE_SHARE_INBOUND_TYPES))) {
-                if (D) Log.w(TAG, "mimeType is null or in unacceptable list, reject the transfer");
-                pre_reject = true;
-                obexResponse = ResponseCodes.OBEX_HTTP_UNSUPPORTED_TYPE;
+                // Reject policy: anything outside the "white list" plus
+                // unspecified MIME Types.
+                // Also reject everything in the "black list".
+                if (!pre_reject
+                        && (mimeType == null
+                                || (!isWhitelisted && !Constants.mimeTypeMatches(mimeType,
+                                        Constants.ACCEPTABLE_SHARE_INBOUND_TYPES))
+                                || Constants.mimeTypeMatches(mimeType,
+                                Constants.UNACCEPTABLE_SHARE_INBOUND_TYPES))) {
+                    if (D)
+                        Log.w(TAG,
+                                "mimeType is null or in unacceptable list, reject the transfer. mimeType is "
+                                        + ((mimeType == null) ? "null" : mimeType));
+                    pre_reject = true;
+                    obexResponse = ResponseCodes.OBEX_HTTP_UNSUPPORTED_TYPE;
+                }
+            } else {
+                if (D)
+                    Log.i(TAG, "isAcceptAllFilesEnabled == true, skipped check of mime type");
+                if (mimeType == null) {
+                    mimeType = "*/*";
+                    if (D)
+                        Log.i(TAG, "mimeType is null. Fixed to */*");
+                }
             }
 
             if (pre_reject && obexResponse != ResponseCodes.OBEX_HTTP_OK) {
@@ -381,9 +405,7 @@ public class BluetoothOppObexServerSession extends ServerRequestHandler implemen
 
         values.put(BluetoothShare.FILENAME_HINT, name);
 
-        if (length != null) {
-            values.put(BluetoothShare.TOTAL_BYTES, length.intValue());
-        }
+        values.put(BluetoothShare.TOTAL_BYTES, length);
 
         values.put(BluetoothShare.MIMETYPE, mimeType);
 
@@ -661,8 +683,9 @@ public class BluetoothOppObexServerSession extends ServerRequestHandler implemen
             if (position == fileInfo.mLength) {
                 long endTime = System.currentTimeMillis();
                 Log.i(TAG, "Receiving file completed for " + fileInfo.mFileName
-                        + " length " + fileInfo.mLength
-                        + " Bytes in " + (endTime - beginTime) + "ms"  );
+                        + " length " + fileInfo.mLength + " Bytes. Approx. throughput is "
+                        + BluetoothShare.throughputInKbps(fileInfo.mLength, (endTime - beginTime))
+                        + " Kbps");
                 status = BluetoothShare.STATUS_SUCCESS;
             } else {
                 Log.i(TAG, "Reading file failed at " + position + " of " + fileInfo.mLength);
