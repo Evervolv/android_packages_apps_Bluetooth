@@ -90,14 +90,6 @@
                     android:pathPrefix="/btopp"
                     android:permission="android.permission.ACCESS_BLUETOOTH_SHARE" />
         </provider>
-        <provider android:name="android.support.v4.content.FileProvider"
-            android:authorities="com.google.android.bluetooth.fileprovider"
-            android:grantUriPermissions="true"
-            android:exported="false">
-            <meta-data
-                android:name="android.support.FILE_PROVIDER_PATHS"
-                android:resource="@xml/file_paths" />
-        </provider>
         <provider android:name=".avrcp.BluetoothAvrcpDataProvider"
             android:authorities="com.android.bluetooth.avrcp"
             android:exported="true"
@@ -105,6 +97,14 @@
             <path-permission
                     android:pathPrefix="/btavrcp_ct"
                     android:permission="android.permission.ACCESS_BLUETOOTH_AVRCP_CT_DATA" />
+        </provider>
+        <provider android:name="android.support.v4.content.FileProvider"
+            android:authorities="com.google.android.bluetooth.fileprovider"
+            android:grantUriPermissions="true"
+            android:exported="false">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
         </provider>
         <service
             android:process="@string/process"

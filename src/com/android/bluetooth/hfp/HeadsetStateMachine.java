@@ -59,6 +59,7 @@ import android.os.Message;
 import android.os.ParcelUuid;
 import android.os.RemoteException;
 import android.os.ServiceManager;
+import android.os.SystemProperties;
 import android.os.PowerManager;
 import android.os.UserHandle;
 import android.os.PowerManager.WakeLock;
@@ -823,6 +824,11 @@ final class HeadsetStateMachine extends StateMachine {
     private class Connected extends State {
         @Override
         public void enter() {
+            // Remove pending connection attempts that were deferred during the pending
+            // state. This is to prevent auto connect attempts from disconnecting
+            // devices that previously successfully connected.
+            // TODO: This needs to check for multiple HFP connections, once supported...
+            removeDeferredMessages(CONNECT);
             Log.d(TAG, "Enter Connected: " + getCurrentMessage().what +
                            ", size: " + mConnectedDevicesList.size());
             // start phone state listener here so that the CIND response as part of SLC can be
@@ -1753,8 +1759,15 @@ final class HeadsetStateMachine extends StateMachine {
             int volumeValue = intent.getIntExtra(AudioManager.EXTRA_VOLUME_STREAM_VALUE, 0);
             if (mPhoneState.getSpeakerVolume() != volumeValue) {
                 mPhoneState.setSpeakerVolume(volumeValue);
-                setVolumeNative(HeadsetHalConstants.VOLUME_TYPE_SPK,
+            boolean scoVolume =
+                    SystemProperties.getBoolean("bt.pts.certification", false);
+                if (!scoVolume) {
+                    setVolumeNative(HeadsetHalConstants.VOLUME_TYPE_SPK,
                                         volumeValue, getByteAddress(device));
+                } else {
+                    setVolumeNative(HeadsetHalConstants.VOLUME_TYPE_SPK,
+                                        0, getByteAddress(device));
+                }
             }
         }
 
@@ -2310,8 +2323,15 @@ final class HeadsetStateMachine extends StateMachine {
             int volumeValue = intent.getIntExtra(AudioManager.EXTRA_VOLUME_STREAM_VALUE, 0);
             if (mPhoneState.getSpeakerVolume() != volumeValue) {
                 mPhoneState.setSpeakerVolume(volumeValue);
-                setVolumeNative(HeadsetHalConstants.VOLUME_TYPE_SPK,
-                                    volumeValue, getByteAddress(device));
+            boolean scoVolume =
+                    SystemProperties.getBoolean("bt.pts.certification", false);
+                if (!scoVolume) {
+                    setVolumeNative(HeadsetHalConstants.VOLUME_TYPE_SPK,
+                                        volumeValue, getByteAddress(device));
+                } else {
+                    setVolumeNative(HeadsetHalConstants.VOLUME_TYPE_SPK,
+                                        0, getByteAddress(device));
+                }
             }
         }
     }
@@ -3093,6 +3113,12 @@ final class HeadsetStateMachine extends StateMachine {
                 }
                 atResponseCodeNative(HeadsetHalConstants.AT_RESPONSE_OK,
                                                        0, getByteAddress(device));
+
+                removeMessages(DIALING_OUT_TIMEOUT);
+        } else if (callState.mCallState ==
+                HeadsetHalConstants.CALL_STATE_ACTIVE || callState.mCallState
+                == HeadsetHalConstants.CALL_STATE_IDLE) {
+                mDialingOut = false;
         }
 
         /* Set ActiveScoDevice to null when call ends */
